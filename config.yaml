@@ -1,8 +1,14 @@
 # ── Model Configuration ──
 models:
-  fast: "gemini-2.0-flash"
-  pro: "gemini-2.5-pro"
-  embedding: "gemini-embedding-001"
+  provider: "omp-subscription"
+  generation: "openai-codex/gpt-5.6-luna"
+  thinking: "low"
+  context_window_tokens: 272000
+  timeout_s: 300
+
+subscription:
+  call_limit: 40
+
 
 # ── Budget ──
 budget:
@@ -17,32 +23,25 @@ chunking:
 
 # ── Retrieval ──
 retrieval:
+  mode: "bm25"
   bm25_top_k: 20
-  vector_top_k: 20
-  hybrid_top_k: 10
-  rrf_k: 60              # RRF constant
+  rag_top_k: 10
+
 
 # ── RLM Controller ──
 rlm:
-  max_depth: 4
-  confidence_threshold: 0.5      # Was 0.7 — lowered so recursion actually triggers
-  max_sub_questions: 3
-  max_chunks_per_step: 10         # Was 5 — match RAG baseline
-  initial_chunks: 10              # Top-level retrieval count
-  sub_question_chunks: 5          # Sub-question retrieval count
-  max_steps: 8
-  history_chars: 5000
+  max_depth: 1
+  max_iterations: 12
+  max_subcalls: 12
+  history_chars: 12000
+  stdout_chars: 3000
+
 
 # ── Baselines ──
 fullcontext:
-  max_input_tokens: 900000    # Gemini 2.0 Flash context
+  max_input_tokens: 260000
 
-rag:
-  top_k: 10
 
-mapreduce:
-  map_chunk_count: 10
-  reduce_max_tokens: 4096
 
 # ── Benchmarks ──
 benchmarks:
@@ -77,9 +76,18 @@ benchmarks:
     hops: [2, 3, 4]
     doc_lengths: [10000, 50000, 100000]
     methods: ["rag", "rlm"]
+  diagnostic:
+    sniah_context_lengths: [32768, 131072, 384000]
+    sniah_tasks_per_length: 10
+    dense_record_counts: [500, 2000, 8000]
+    dense_tasks_per_size: 10
+    oolong_dataset: "oolongbench/oolong-synth"
+    oolong_revision: "f0d59eaf0febf130664cfceb710436c8e3216b2b"
+    max_samples: 50
+
 
 # ── Experiment ──
 experiment:
   seed: 42
-  methods: ["fullcontext", "rag", "mapreduce", "rlm"]
+  methods: ["fullcontext", "rag", "rlm_depth0", "rlm_depth1"]
   output_dir: "results"

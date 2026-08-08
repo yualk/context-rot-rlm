@@ -1,4 +1,4 @@
-"""Full-context baseline: send entire document to LLM."""
+"""Full-context baseline using the same subscription-backed model as RLM."""
 
 from __future__ import annotations
 
@@ -7,36 +7,40 @@ from typing import Any
 from src.config import settings
 from src.controllers.base import BaseController, ControllerResult
 from src.environment.document_store import DocumentStore
-from src.gemini_client import generate_json
+from src.model_client import ModelClient, get_default_client
 from src.trace.tracer import TraceNode
 
-SYSTEM = """You are a precise question-answering system. Answer the question based ONLY on the provided document.
-
-Respond with JSON: {"answer": "...", "confidence": 0.0-1.0, "reasoning": "..."}
-
-IMPORTANT:
-- The "answer" field must be SHORT: just the final fact, name, place, number, or brief phrase.
-- Do not return a full sentence in the "answer" field.
-- Put any explanation in "reasoning"."""
+SYSTEM = """Answer from the provided document only.
+Return JSON with keys `answer`, `confidence`, and `reasoning`.
+Keep `answer` to the shortest fact or phrase that answers the question."""
 
 PROMPT = """Document:
 {document}
 
 Question: {question}
+"""
 
-Answer based only on the document above.
-IMPORTANT: The "answer" field must be SHORT and answer-only, not a full sentence.
-Respond as JSON with keys: answer, confidence, reasoning."""
+
+class ContextWindowExceeded(ValueError):
+    """The complete prompt cannot fit without changing baseline semantics."""
 
 
 class FullContextController(BaseController):
-    """Sends the entire document as context to the LLM."""
+    """Send the complete document once; never silently truncate it."""
 
     method_name = "fullcontext"
     requires_retriever = False
 
-    def __init__(self, model: str | None = None):
-        self.model = model or settings.model_fast
+    def __init__(
+        self,
+        model: str | None = None,
+        *,
+        client: ModelClient | None = None,
+        max_input_tokens: int | None = None,
+    ) -> None:
+        del model
+        self.client = client or get_default_client()
+        self.max_input_tokens = max_input_tokens or settings.fullcontext_max_tokens
 
     def answer(
         self,
@@ -44,25 +48,34 @@ class FullContextController(BaseController):
         store: DocumentStore,
         **kwargs: Any,
     ) -> ControllerResult:
+        del kwargs
         trace = TraceNode(action="fullcontext", input=question)
+        prompt = PROMPT.format(document=store.full_text, question=question)
+        estimated_tokens = _estimate_tokens(prompt) + 100
+        trace.metadata["estimated_input_tokens"] = estimated_tokens
+        if estimated_tokens > self.max_input_tokens:
+            trace.metadata["context_window_exceeded"] = True
+            trace.finish()
+            raise ContextWindowExceeded(
+                f"Estimated input is {estimated_tokens} tokens; full-context limit is "
+                f"{self.max_input_tokens}. Refusing to truncate the baseline."
+            )
 
-        doc_text = store.full_text
-        # Truncate if needed (by word count)
-        words = doc_text.split()
-        if len(words) > settings.fullcontext_max_tokens:
-            doc_text = " ".join(words[: settings.fullcontext_max_tokens])
-            trace.add_child(TraceNode(action="truncate", input=f"{len(words)} -> {settings.fullcontext_max_tokens} words"))
-
-        prompt = PROMPT.format(document=doc_text, question=question)
-        result = generate_json(prompt, model=self.model, system=SYSTEM)
-
-        trace.output = result.get("answer", "")
-        trace.metadata["confidence"] = result.get("confidence", 0.0)
-
+        payload = self.client.generate_json(prompt, system=SYSTEM, max_tokens=500)
+        answer = str(payload.get("answer", "")).strip()
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+        trace.output = answer
+        trace.metadata.update({"confidence": confidence, "context_window_exceeded": False})
+        trace.finish()
         return ControllerResult(
-            answer=result.get("answer", ""),
-            confidence=result.get("confidence", 0.0),
+            answer=answer,
+            confidence=confidence,
             method=self.method_name,
             trace=trace,
-            metadata={"reasoning": result.get("reasoning", "")},
+            metadata={"reasoning": str(payload.get("reasoning", ""))},
         )
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative provider-independent approximation used only as a guard."""
+    return max(1, (len(text) + 3) // 4)

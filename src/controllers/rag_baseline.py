@@ -1,26 +1,43 @@
-"""Single-pass RAG baseline: retrieve → answer."""
+"""Single-pass BM25 retrieval baseline."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from src.config import settings
 from src.controllers.base import BaseController, ControllerResult
+from src.environment.bm25_index import BM25Index
 from src.environment.document_store import DocumentStore
-from src.environment.hybrid_retriever import HybridRetriever
-from src.tools.read_tool import ReadTool
-from src.tools.reason_tool import ReasonTool
-from src.tools.search_tool import SearchTool
+from src.model_client import ModelClient, get_default_client
 from src.trace.tracer import TraceNode
+
+SYSTEM = """Answer the question using only the retrieved evidence.
+Return JSON with keys `answer`, `confidence`, and `reasoning`.
+Keep `answer` short. If the evidence is insufficient, use an empty answer and confidence 0."""
+
+PROMPT = """Evidence:
+{evidence}
+
+Question: {question}
+"""
 
 
 class RAGController(BaseController):
-    """Single-pass retrieve-and-generate."""
+    """Build a BM25 index, retrieve once, and generate once."""
 
     method_name = "rag"
+    requires_retriever = False
 
-    def __init__(self, model: str | None = None, top_k: int | None = None):
-        self.model = model or settings.model_fast
+    def __init__(
+        self,
+        model: str | None = None,
+        top_k: int | None = None,
+        *,
+        client: ModelClient | None = None,
+    ) -> None:
+        del model
+        self.client = client or get_default_client()
         self.top_k = top_k or settings.rag_top_k
 
     def answer(
@@ -29,45 +46,71 @@ class RAGController(BaseController):
         store: DocumentStore,
         **kwargs: Any,
     ) -> ControllerResult:
-        trace = TraceNode(action="rag", input=question)
+        del kwargs
+        trace = TraceNode(action="rag", input=question, metadata={"retriever": "bm25"})
 
-        retriever = kwargs.get("retriever")
-        if retriever is None:
-            retriever = HybridRetriever(store, cache_key=kwargs.get("cache_key", ""))
+        build_start = time.perf_counter()
+        index = BM25Index(top_k=self.top_k)
+        index.build(store.chunks)
+        build_s = time.perf_counter() - build_start
 
-        search = SearchTool(retriever)
-        read = ReadTool(store)
-        reason = ReasonTool(model=self.model)
+        query_start = time.perf_counter()
+        hits = index.search(question, top_k=self.top_k)
+        query_s = time.perf_counter() - query_start
+        chunk_ids = [chunk_id for chunk_id, _ in hits]
+        evidence = store.get_chunks_text(chunk_ids)
 
-        # Search
-        chunk_ids = search(question, top_k=self.top_k)
-        trace.add_child(TraceNode(
-            action="search", input=question,
-            output=str(chunk_ids),
-        ))
+        search_node = trace.add_child(
+            TraceNode(
+                action="search",
+                input=question,
+                output=str(chunk_ids),
+                metadata={
+                    "retriever": "bm25",
+                    "top_k": self.top_k,
+                    "build_s": build_s,
+                    "query_s": query_s,
+                    "hit_count": len(chunk_ids),
+                },
+            )
+        )
+        search_node.finish()
 
-        # Read
-        evidence = read(chunk_ids)
-        trace.add_child(TraceNode(
-            action="read", input=str(chunk_ids),
-            output=f"({len(evidence)} chars)",
-        ))
-
-        # Reason
-        result = reason.reason(question, evidence)
-        trace.add_child(TraceNode(
-            action="reason", input=question,
-            output=result.answer,
-            metadata={"confidence": result.confidence},
-        ))
-
-        trace.output = result.answer
-        trace.metadata["confidence"] = result.confidence
-
+        payload = self.client.generate_json(
+            PROMPT.format(evidence=evidence, question=question),
+            system=SYSTEM,
+            max_tokens=500,
+        )
+        answer = str(payload.get("answer", "")).strip()
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+        reason_node = trace.add_child(
+            TraceNode(
+                action="reason",
+                input=question,
+                output=answer,
+                metadata={"confidence": confidence},
+            )
+        )
+        reason_node.finish()
+        trace.output = answer
+        trace.metadata.update(
+            {
+                "confidence": confidence,
+                "retrieval_build_s": build_s,
+                "retrieval_query_s": query_s,
+                "retrieved_chunks": len(chunk_ids),
+            }
+        )
+        trace.finish()
         return ControllerResult(
-            answer=result.answer,
-            confidence=result.confidence,
+            answer=answer,
+            confidence=confidence,
             method=self.method_name,
             trace=trace,
-            metadata={"reasoning": result.reasoning},
+            metadata={
+                "reasoning": str(payload.get("reasoning", "")),
+                "retrieval_build_s": build_s,
+                "retrieval_query_s": query_s,
+                "retrieved_chunks": len(chunk_ids),
+            },
         )

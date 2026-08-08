@@ -25,6 +25,10 @@ class TraceNode:
 
     def finish(self) -> None:
         self.end_time = time.time()
+        for child in self.children:
+            if child.end_time is None:
+                child.finish()
+
 
     @property
     def duration(self) -> float | None:
@@ -39,12 +43,17 @@ class TraceNode:
 
     def node_count(self) -> int:
         return 1 + sum(c.node_count() for c in self.children)
+    def walk(self):
+        """Yield this node and all descendants depth-first."""
+        yield self
+        for child in self.children:
+            yield from child.walk()
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "action": self.action,
-            "input": self.input[:200] if self.input else "",
-            "output": self.output[:200] if self.output else "",
+            "input": self.input or "",
+            "output": self.output or "",
         }
         if self.metadata:
             d["metadata"] = self.metadata

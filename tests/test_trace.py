@@ -36,6 +36,13 @@ def test_to_dict():
     assert len(d["children"]) == 1
 
 
+
+def test_to_dict_preserves_complete_repl_code_for_audit():
+    code = "answer = " + repr("x" * 500)
+    node = TraceNode(action="repl_exec", input=code)
+
+    assert node.to_dict()["input"] == code
+
 def test_export_trace():
     root = TraceNode(action="test", output="result")
     root.add_child(TraceNode(action="step1"))

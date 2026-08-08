@@ -26,12 +26,15 @@ _YAML: dict[str, Any] = _load_yaml()
 
 
 class Settings(BaseSettings):
-    google_api_key: str = Field(default="")
+    # Subscription-backed generation
+    model_provider: str = _YAML["models"]["provider"]
+    model_generation: str = _YAML["models"]["generation"]
+    model_thinking: str = _YAML["models"]["thinking"]
+    model_context_window: int = _YAML["models"]["context_window_tokens"]
+    model_timeout_s: int = _YAML["models"]["timeout_s"]
+    omp_executable: str = "omp"
+    subscription_call_limit: int = _YAML["subscription"]["call_limit"]
 
-    # Models
-    model_fast: str = _YAML["models"]["fast"]
-    model_pro: str = _YAML["models"]["pro"]
-    model_embedding: str = _YAML["models"]["embedding"]
 
     # Budget
     max_dollars: float = _YAML["budget"]["max_dollars"]
@@ -44,25 +47,18 @@ class Settings(BaseSettings):
 
     # Retrieval
     bm25_top_k: int = _YAML["retrieval"]["bm25_top_k"]
-    vector_top_k: int = _YAML["retrieval"]["vector_top_k"]
-    hybrid_top_k: int = _YAML["retrieval"]["hybrid_top_k"]
-    rrf_k: int = _YAML["retrieval"]["rrf_k"]
+    rag_top_k: int = _YAML["retrieval"]["rag_top_k"]
 
     # RLM
     rlm_max_depth: int = _YAML["rlm"]["max_depth"]
-    rlm_confidence_threshold: float = _YAML["rlm"]["confidence_threshold"]
-    rlm_max_sub_questions: int = _YAML["rlm"]["max_sub_questions"]
-    rlm_max_chunks_per_step: int = _YAML["rlm"]["max_chunks_per_step"]
-    rlm_initial_chunks: int = _YAML["rlm"]["initial_chunks"]
-    rlm_sub_question_chunks: int = _YAML["rlm"]["sub_question_chunks"]
-    rlm_max_steps: int = _YAML["rlm"]["max_steps"]
+    rlm_max_iterations: int = _YAML["rlm"]["max_iterations"]
+    rlm_max_subcalls: int = _YAML["rlm"]["max_subcalls"]
     rlm_history_chars: int = _YAML["rlm"]["history_chars"]
+    rlm_stdout_chars: int = _YAML["rlm"]["stdout_chars"]
+
 
     # Baselines
     fullcontext_max_tokens: int = _YAML["fullcontext"]["max_input_tokens"]
-    rag_top_k: int = _YAML["rag"]["top_k"]
-    mapreduce_map_chunks: int = _YAML["mapreduce"]["map_chunk_count"]
-    mapreduce_reduce_max: int = _YAML["mapreduce"]["reduce_max_tokens"]
 
     # Benchmarks
     benchmark_cfg: dict[str, Any] = _YAML["benchmarks"]
