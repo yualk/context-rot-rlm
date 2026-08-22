@@ -1,735 +1,316 @@
-"""Experiment runner: load → run → score → save."""
+"""Reproducible paired runner for sparse and dense long-context diagnostics."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
-import logging
+import random
+import subprocess
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
-from tqdm import tqdm
-
-from benchmarks.longbench_loader import LongBenchSample, load_longbench
-from benchmarks.metrics import compute_all_metrics
-from benchmarks.musique_loader import MuSiQueSample, load_musique
-from benchmarks.multihop_synthetic import MultihopSample, generate_benchmark as gen_multihop
-from benchmarks.needle_haystack import NeedleSample, generate_benchmark as gen_needle
+from benchmarks.diagnostic import (
+    DiagnosticSample,
+    OOLONG_REVISION,
+    OolongScorer,
+    generate_dense_aggregation,
+    generate_sniah,
+    load_oolong,
+)
+from experiments.result_store import ResultStore, configuration_hash
 from src.config import PROJECT_ROOT, settings
-from src.controllers.base import BaseController, ControllerResult
-from src.controllers.fullcontext import FullContextController
-from src.controllers.mapreduce import MapReduceController
+from src.controllers.base import BaseController
+from src.controllers.fullcontext import ContextWindowExceeded, FullContextController
 from src.controllers.rag_baseline import RAGController
 from src.controllers.rlm_controller import RLMController
-from src.cost_tracker import BudgetExceededError, UsageSnapshot, tracker
+from src.cost_tracker import tracker
 from src.environment.document_store import DocumentStore
-from src.environment.hybrid_retriever import HybridRetriever
+from src.model_client import ModelClient, SubscriptionLimitError, get_default_client
 from src.trace.trace_viewer import export_trace
 
-logger = logging.getLogger(__name__)
-
 RESULTS_DIR = PROJECT_ROOT / settings.output_dir
+PRIMARY_METHODS = ("fullcontext", "rag", "rlm_depth0", "rlm_depth1")
+ControllerFactory = Callable[[str], BaseController]
 
 
-def _require_google_api_key() -> None:
-    """Fail fast before burning a run on guaranteed auth errors."""
-    if settings.google_api_key.strip():
-        return
-    raise RuntimeError(
-        "GOOGLE_API_KEY is not set. Add it to the environment or a .env file "
-        "before running live Gemini benchmarks."
+def get_controller(method: str, *, client: ModelClient | None = None) -> BaseController:
+    """Construct comparable controllers around one generation client."""
+    shared = client or get_default_client()
+    if method == "fullcontext":
+        return FullContextController(client=shared)
+    if method == "rag":
+        return RAGController(client=shared)
+    if method == "rlm_depth0":
+        return RLMController(client=shared, max_depth=0)
+    if method == "rlm_depth1":
+        return RLMController(client=shared, max_depth=1)
+    raise ValueError(f"Unknown method {method!r}; choose from {PRIMARY_METHODS}.")
+
+
+class ExperimentRunner:
+    """Run paired sample/method cells and persist each cell immediately."""
+
+    def __init__(
+        self,
+        *,
+        samples: Iterable[DiagnosticSample],
+        methods: Iterable[str],
+        output_path: str | Path,
+        benchmark: str,
+        seed: int = 42,
+        client: ModelClient | None = None,
+        controller_factory: ControllerFactory | None = None,
+        trace_dir: str | Path | None = None,
+        manifest_extra: dict[str, Any] | None = None,
+    ) -> None:
+        self.samples = list(samples)
+        self.methods = tuple(methods)
+        unknown = set(self.methods).difference(PRIMARY_METHODS)
+        if unknown and controller_factory is None:
+            raise ValueError(f"Unknown methods: {sorted(unknown)}")
+        if len(self.methods) != len(set(self.methods)):
+            raise ValueError("Methods must be unique.")
+        self.benchmark = benchmark
+        self.seed = seed
+        self.client = client or (None if controller_factory else get_default_client())
+        self.controller_factory = controller_factory or (
+            lambda method: get_controller(method, client=self.client)
+        )
+        self.controllers = {method: self.controller_factory(method) for method in self.methods}
+        self.trace_dir = Path(trace_dir) if trace_dir is not None else None
+
+        scientific_config = {
+            "benchmark": benchmark,
+            "methods": list(self.methods),
+            "model_provider": settings.model_provider,
+            "model": settings.model_generation,
+            "thinking": settings.model_thinking,
+            "context_window_tokens": settings.model_context_window,
+            "fullcontext_max_tokens": settings.fullcontext_max_tokens,
+            "chunk_size": settings.chunk_size,
+            "chunk_overlap": settings.chunk_overlap,
+            "rag_top_k": settings.rag_top_k,
+            "rlm": {
+                "max_iterations": settings.rlm_max_iterations,
+                "max_subcalls": settings.rlm_max_subcalls,
+                "history_chars": settings.rlm_history_chars,
+            },
+            "seed": seed,
+            "source_revision": _source_revision(),
+            **(manifest_extra or {}),
+        }
+        config_hash = configuration_hash(scientific_config)
+        manifest = {
+            **scientific_config,
+            "operational": {
+                "subscription_call_limit": settings.subscription_call_limit,
+                "sample_count": len(self.samples),
+                "result_format": "jsonl",
+                "method_order": "deterministically shuffled within sample",
+            },
+        }
+        self.store = ResultStore(output_path, config_hash=config_hash, manifest=manifest)
+
+    def run(self) -> list[dict[str, Any]]:
+        for sample in self.samples:
+            methods = list(self.methods)
+            random.Random(_stable_seed(self.seed, sample.sample_id)).shuffle(methods)
+            for method in methods:
+                if not self.store.pending(method, [sample.sample_id]):
+                    continue
+                stop = self._run_cell(sample, method)
+                if stop:
+                    return self._configuration_rows()
+        return self._configuration_rows()
+
+    def _run_cell(self, sample: DiagnosticSample, method: str) -> bool:
+        controller = self.controllers[method]
+        store = DocumentStore()
+        store.ingest(sample.document, doc_id=sample.sample_id)
+        usage_start = tracker.snapshot()
+        started = time.perf_counter()
+        status = "ok"
+        error = ""
+        prediction = ""
+        confidence = 0.0
+        controller_metadata: dict[str, Any] = {}
+        trace = None
+        stop = False
+        try:
+            result = controller.answer(sample.question, store)
+            prediction = result.answer
+            confidence = result.confidence
+            controller_metadata = result.metadata
+            trace = result.trace
+        except ContextWindowExceeded as exc:
+            status = "context_window_exceeded"
+            error = str(exc)
+        except SubscriptionLimitError as exc:
+            status = "subscription_limit"
+            error = str(exc)
+            stop = True
+        except Exception as exc:
+            status = "error"
+            error = f"{type(exc).__name__}: {exc}"
+
+        duration_s = time.perf_counter() - started
+        usage = tracker.delta(usage_start)
+        score = _score(sample, prediction) if status == "ok" else 0.0
+        row = {
+            "sample_id": sample.sample_id,
+            "task_identity": sample.task_identity,
+            "method": method,
+            "status": status,
+            "question": sample.question,
+            "reference": sample.answer,
+            "prediction": prediction,
+            "score": score,
+            "confidence": confidence,
+            "duration_s": duration_s,
+            "context_length_tokens": sample.context_length_tokens,
+            "needle_position": sample.needle_position,
+            "generation_input_tokens": usage.generation_input_tokens,
+            "generation_output_tokens": usage.generation_output_tokens,
+            "generation_cache_read_tokens": usage.generation_cache_read_tokens,
+            "generation_cache_write_tokens": usage.generation_cache_write_tokens,
+            "generation_calls": usage.generation_calls,
+            "embedding_input_tokens": usage.embedding_input_tokens,
+            "embedding_calls": usage.embedding_calls,
+            "billed_cost_usd": usage.cost_usd,
+            "estimated_cost_usd": usage.estimated_cost_usd,
+            "usage_exact": usage.exact,
+            "error": error,
+            "sample_metadata": sample.metadata,
+            "controller_metadata": controller_metadata,
+        }
+        self.store.append(row)
+        if self.trace_dir is not None and trace is not None:
+            export_trace(trace, self.trace_dir / f"{sample.sample_id}.{method}.json")
+        return stop
+
+    def _configuration_rows(self) -> list[dict[str, Any]]:
+        return [
+            row for row in self.store.rows if row.get("config_hash") == self.store.config_hash
+        ]
+
+
+def _score(sample: DiagnosticSample, prediction: str) -> float:
+    benchmark = sample.metadata.get("benchmark")
+    if benchmark in {"oolong", "dense_aggregation"}:
+        return OolongScorer().score(
+            prediction,
+            sample.answer,
+            sample.metadata.get("answer_type"),
+        )
+    return float(_normalize_answer(prediction) == _normalize_answer(sample.answer))
+
+
+def _normalize_answer(value: str) -> str:
+    return " ".join(value.strip().casefold().split()).strip(".,;:[](){}\"'")
+
+
+def _stable_seed(seed: int, sample_id: str) -> int:
+    digest = hashlib.sha256(f"{seed}:{sample_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _source_revision() -> str:
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        head = "unknown"
+
+    digest = hashlib.sha256()
+    roots = ("analysis", "benchmarks", "experiments", "src", "tests")
+    files = [
+        path
+        for root in roots
+        for path in (PROJECT_ROOT / root).rglob("*.py")
+        if "__pycache__" not in path.parts
+    ]
+    files.extend((PROJECT_ROOT / "config.yaml", PROJECT_ROOT / "requirements.txt"))
+    for path in sorted(files):
+        digest.update(path.relative_to(PROJECT_ROOT).as_posix().encode())
+        digest.update(path.read_bytes())
+    return f"{head}-tree-{digest.hexdigest()[:12]}"
+
+
+def _build_samples(args: argparse.Namespace) -> tuple[list[DiagnosticSample], dict[str, Any]]:
+    if args.benchmark == "sniah":
+        lengths = args.context_lengths or settings.benchmark_cfg["diagnostic"]["sniah_context_lengths"]
+        samples = generate_sniah(
+            context_lengths=lengths,
+            tasks_per_length=args.tasks,
+            seed=args.seed,
+        )
+        return samples, {"context_lengths": lengths, "tasks_per_length": args.tasks}
+    if args.benchmark == "dense":
+        sizes = args.record_counts or settings.benchmark_cfg["diagnostic"]["dense_record_counts"]
+        samples = [
+            generate_dense_aggregation(num_records=size, seed=args.seed + task)
+            for size in sizes
+            for task in range(args.tasks)
+        ]
+        return samples, {"record_counts": sizes, "tasks_per_size": args.tasks}
+    samples = load_oolong(
+        split=args.split,
+        max_samples=args.max_samples,
+        revision=OOLONG_REVISION,
+        context_lengths=args.context_lengths,
     )
-
-
-def get_controller(method: str, model: str | None = None) -> BaseController:
-    """Factory for controllers."""
-    controllers = {
-        "fullcontext": FullContextController,
-        "rag": RAGController,
-        "mapreduce": MapReduceController,
-        "rlm": RLMController,
+    return samples, {
+        "dataset": "oolongbench/oolong-synth",
+        "dataset_revision": OOLONG_REVISION,
+        "split": args.split,
+        "max_samples": args.max_samples,
+        "context_lengths": args.context_lengths,
     }
-    cls = controllers[method]
-    return cls(model=model) if model else cls()
 
 
-@dataclass
-class SampleResult:
-    sample_id: str
-    method: str
-    question: str
-    predicted: str
-    reference: str
-    metrics: dict[str, float]
-    confidence: float
-    duration_s: float
-    input_tokens: int = 0
-    output_tokens: int = 0
-    llm_calls: int = 0
-    cost_usd: float = 0.0
-    status: str = "ok"
-    metadata: dict[str, Any] = field(default_factory=dict)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("benchmark", choices=("sniah", "dense", "oolong"))
+    parser.add_argument("--methods", nargs="+", choices=PRIMARY_METHODS, default=list(PRIMARY_METHODS))
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--seed", type=int, default=settings.seed)
+    parser.add_argument("--tasks", type=int, default=10)
+    parser.add_argument("--max-samples", type=int, default=50)
+    parser.add_argument("--context-lengths", type=int, nargs="+")
+    parser.add_argument("--record-counts", type=int, nargs="+")
+    parser.add_argument("--split", choices=("validation", "test"), default="validation")
+    return parser
 
 
-def _run_single(
-    controller: BaseController,
-    document: str,
-    question: str,
-    sample_id: str,
-    trace_dir: Path | None = None,
-) -> tuple[ControllerResult, float]:
-    """Run a single QA sample through a controller."""
-    store = DocumentStore()
-    store.ingest(document, doc_id=sample_id)
-
-    retriever = None
-    cache_key = ""
-    if getattr(controller, "requires_retriever", True):
-        doc_hash = hashlib.md5(document.encode("utf-8")).hexdigest()[:12]
-        cache_key = f"{sample_id}_{settings.model_embedding}_{store.num_chunks}_{doc_hash}"
-        retriever = HybridRetriever(store, cache_key=cache_key)
-
-    start = time.time()
-    result = controller.answer(
-        question, store, retriever=retriever, cache_key=cache_key
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    samples, benchmark_config = _build_samples(args)
+    output = args.output or RESULTS_DIR / f"{args.benchmark}.jsonl"
+    runner = ExperimentRunner(
+        samples=samples,
+        methods=args.methods,
+        output_path=output,
+        benchmark=args.benchmark,
+        seed=args.seed,
+        trace_dir=args.trace_dir,
+        manifest_extra={"benchmark_config": benchmark_config},
     )
-    elapsed = time.time() - start
-
-    # Export trace
-    if trace_dir and result.trace:
-        export_trace(result.trace, trace_dir / f"{sample_id}.json")
-
-    return result, elapsed
-
-
-def _usage_payload(start: UsageSnapshot) -> dict[str, int | float]:
-    delta = tracker.delta(start)
-    return {
-        "input_tokens": delta.input_tokens,
-        "output_tokens": delta.output_tokens,
-        "llm_calls": delta.calls,
-        "cost_usd": delta.cost_usd,
-    }
-
-
-def _classify_error(exc: Exception) -> str:
-    err = str(exc)
-    transient_markers = (
-        "429",
-        "RESOURCE_EXHAUSTED",
-        "503",
-        "UNAVAILABLE",
-        "500 INTERNAL",
-        "'status': 'INTERNAL'",
-        '"status": "INTERNAL"',
-    )
-    return "transient_error" if any(marker in err for marker in transient_markers) else "error"
-
-
-def _load_partial(filename: str) -> tuple[list[SampleResult], set[str]]:
-    """Load existing partial results and return (results, completed_methods)."""
-    path = RESULTS_DIR / f"{filename}.json"
-    if not path.exists():
-        return [], set()
-
-    with open(path) as f:
-        data = json.load(f)
-
-    results = []
-    method_sample_counts: dict[str, int] = {}
-    for r in data:
-        results.append(SampleResult(
-            sample_id=r["sample_id"],
-            method=r["method"],
-            question=r["question"],
-            predicted=r["predicted"],
-            reference=r["reference"],
-            metrics=r["metrics"],
-            confidence=r["confidence"],
-            duration_s=r["duration_s"],
-            input_tokens=r.get("input_tokens", 0),
-            output_tokens=r.get("output_tokens", 0),
-            llm_calls=r.get("llm_calls", 0),
-            cost_usd=r.get("cost_usd", 0.0),
-            status=r.get("status", "ok"),
-            metadata=r.get("metadata", {}),
-        ))
-        method_sample_counts[r["method"]] = method_sample_counts.get(r["method"], 0) + 1
-
-    completed = set(method_sample_counts.keys())
-    logger.info(
-        "Loaded %d partial results from %s (methods: %s)",
-        len(results), filename, ", ".join(f"{m}={c}" for m, c in sorted(method_sample_counts.items())),
-    )
-    return results, completed
-
-
-def run_needle_haystack(
-    methods: list[str] | None = None,
-    model: str | None = None,
-    max_samples: int | None = None,
-    save_as: str = "needle_haystack",
-    difficulty: str = "standard",
-) -> list[SampleResult]:
-    """Run needle-in-haystack benchmark."""
-    methods = methods or settings.methods
-    samples = gen_needle(difficulty=difficulty)
-    if max_samples:
-        samples = samples[:max_samples]
-
-    results, done_methods = _load_partial(save_as)
-    remaining = [m for m in methods if m not in done_methods]
-    if not remaining:
-        logger.info("needle: all methods already complete, skipping")
-        return results
-    _require_google_api_key()
-
-    logger.info("Running needle-haystack (%s): %d samples x %d methods (skipping %s)",
-                difficulty, len(samples), len(remaining), done_methods or "none")
-
-    for method in remaining:
-        controller = get_controller(method, model)
-        trace_dir = RESULTS_DIR / "traces" / "needle" / method
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(samples, desc=f"needle/{method}")):
-            sid = f"needle_{sample.haystack_length}_{sample.needle_position:.2f}_{i}"
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = compute_all_metrics(result.answer, sample.answer)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "haystack_length": sample.haystack_length,
-                        "needle_position": sample.needle_position,
-                        "requested_needle_position": getattr(sample, "requested_position", sample.needle_position),
-                        "difficulty": getattr(sample, "difficulty", difficulty),
-                        "distractor_count": len(getattr(sample, "distractor_texts", [])),
-                    },
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, save_as)
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "error": str(e),
-                        "error_type": error_type,
-                        "haystack_length": sample.haystack_length,
-                        "needle_position": sample.needle_position,
-                        "requested_needle_position": getattr(sample, "requested_position", sample.needle_position),
-                        "difficulty": getattr(sample, "difficulty", difficulty),
-                        "distractor_count": len(getattr(sample, "distractor_texts", [])),
-                    },
-                ))
-
-        # Incremental save after each method
-        save_results(results, save_as)
-
-    return results
-
-
-def run_multihop(
-    methods: list[str] | None = None,
-    model: str | None = None,
-    max_samples: int | None = None,
-    save_as: str = "multihop",
-) -> list[SampleResult]:
-    """Run multi-hop benchmark."""
-    methods = methods or settings.methods
-    samples = gen_multihop()
-    if max_samples:
-        samples = samples[:max_samples]
-
-    results, done_methods = _load_partial(save_as)
-    remaining = [m for m in methods if m not in done_methods]
-    if not remaining:
-        logger.info("multihop: all methods already complete, skipping")
-        return results
-    _require_google_api_key()
-
-    logger.info("Running multihop: %d samples x %d methods (skipping %s)",
-                len(samples), len(remaining), done_methods or "none")
-
-    for method in remaining:
-        controller = get_controller(method, model)
-        trace_dir = RESULTS_DIR / "traces" / "multihop" / method
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(samples, desc=f"multihop/{method}")):
-            sid = f"multihop_{sample.hops}hop_{sample.doc_length}w_{i}"
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = compute_all_metrics(result.answer, sample.answer)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={"hops": sample.hops, "doc_length": sample.doc_length},
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, save_as)
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={"error": str(e), "error_type": error_type, "hops": sample.hops, "doc_length": sample.doc_length},
-                ))
-
-        # Incremental save after each method
-        save_results(results, save_as)
-
-    return results
-
-
-def run_longbench(
-    methods: list[str] | None = None,
-    model: str | None = None,
-    max_samples: int | None = None,
-    save_as: str = "longbench",
-) -> list[SampleResult]:
-    """Run LongBench (QASPER + NarrativeQA) benchmark."""
-    methods = methods or settings.methods
-    samples = load_longbench(max_samples=max_samples)
-
-    results, done_methods = _load_partial(save_as)
-    remaining = [m for m in methods if m not in done_methods]
-    if not remaining:
-        logger.info("longbench: all methods already complete, skipping")
-        return results
-    _require_google_api_key()
-
-    logger.info("Running longbench: %d samples x %d methods (skipping %s)",
-                len(samples), len(remaining), done_methods or "none")
-
-    for method in remaining:
-        controller = get_controller(method, model)
-        trace_dir = RESULTS_DIR / "traces" / "longbench" / method
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(samples, desc=f"longbench/{method}")):
-            sid = sample.sample_id
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = compute_all_metrics(result.answer, sample.answer)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={"dataset": sample.dataset_name},
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, save_as)
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "error": str(e),
-                        "error_type": error_type,
-                        "dataset": sample.dataset_name,
-                    },
-                ))
-
-        # Incremental save after each method
-        save_results(results, save_as)
-
-    return results
-
-
-def _best_metrics(prediction: str, answer: str, aliases: list[str]) -> dict[str, float]:
-    """Compute metrics against answer and all aliases, return the best F1."""
-    best = compute_all_metrics(prediction, answer)
-    for alias in aliases:
-        alt = compute_all_metrics(prediction, alias)
-        if alt["f1"] > best["f1"]:
-            best = alt
-    return best
-
-
-def run_musique(
-    methods: list[str] | None = None,
-    model: str | None = None,
-    max_samples: int | None = None,
-    save_as: str = "musique",
-) -> list[SampleResult]:
-    """Run MuSiQue multi-hop benchmark (RAG vs RLM stress test)."""
-    cfg = settings.benchmark_cfg.get("musique", {})
-    methods = methods or cfg.get("methods", ["rag", "rlm"])
-    samples = load_musique(max_samples=max_samples)
-
-    results, done_methods = _load_partial(save_as)
-    remaining = [m for m in methods if m not in done_methods]
-    if not remaining:
-        logger.info("musique: all methods already complete, skipping")
-        return results
-    _require_google_api_key()
-
-    logger.info("Running MuSiQue: %d samples x %d methods (skipping %s)",
-                len(samples), len(remaining), done_methods or "none")
-
-    for method in remaining:
-        controller = get_controller(method, model)
-        trace_dir = RESULTS_DIR / "traces" / "musique" / method
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(samples, desc=f"musique/{method}")):
-            sid = sample.sample_id
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = _best_metrics(
-                    result.answer, sample.answer, sample.answer_aliases
-                )
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "hops": sample.hops,
-                        "doc_length": sample.doc_length,
-                        "bridge_entities": sample.bridge_entities,
-                        "sub_questions": sample.sub_questions,
-                    },
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, save_as)
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method=method,
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "error": str(e),
-                        "error_type": error_type,
-                        "hops": sample.hops,
-                        "doc_length": sample.doc_length,
-                    },
-                ))
-
-        # Incremental save after each method
-        save_results(results, save_as)
-
-    return results
-
-
-def run_pro_musique(
-    phase: str = "A",
-    max_samples: int | None = None,
-) -> list[SampleResult]:
-    """Run MuSiQue with Pro model in phases to stay within quota.
-
-    Phase A: RAG on all hops/lengths + RLM on 2-hop only (~1260 calls)
-    Phase B: RLM on 3-hop only (~1500 calls)
-    Skip 4-hop RLM (Flash showed degradation, quota too tight).
-    """
-    cfg = settings.benchmark_cfg.get("musique", {})
-    n = max_samples or cfg.get("num_samples", 10)
-    samples = load_musique(max_samples=n)
-    model = settings.model_pro
-    _require_google_api_key()
-
-    results: list[SampleResult] = []
-
-    if phase == "A":
-        # RAG on all samples
-        controller = get_controller("rag", model)
-        trace_dir = RESULTS_DIR / "traces" / "musique_pro" / "rag"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(samples, desc="musique_pro/rag")):
-            sid = sample.sample_id
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = _best_metrics(result.answer, sample.answer, sample.answer_aliases)
-                results.append(SampleResult(
-                    sample_id=sid, method="rag",
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "hops": sample.hops,
-                        "doc_length": sample.doc_length,
-                        "bridge_entities": sample.bridge_entities,
-                        "sub_questions": sample.sub_questions,
-                        "model": model,
-                    },
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, "musique_pro_phaseA_rag")
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method="rag",
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "error": str(e), "error_type": error_type,
-                        "hops": sample.hops, "doc_length": sample.doc_length,
-                        "model": model,
-                    },
-                ))
-
-        save_results(results, "musique_pro_phaseA_rag")
-
-        # RLM on 2-hop only
-        rlm_samples = [s for s in samples if s.hops == 2]
-        controller = get_controller("rlm", model)
-        trace_dir = RESULTS_DIR / "traces" / "musique_pro" / "rlm"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(rlm_samples, desc="musique_pro/rlm_2hop")):
-            sid = sample.sample_id
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = _best_metrics(result.answer, sample.answer, sample.answer_aliases)
-                results.append(SampleResult(
-                    sample_id=sid, method="rlm",
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "hops": sample.hops,
-                        "doc_length": sample.doc_length,
-                        "bridge_entities": sample.bridge_entities,
-                        "sub_questions": sample.sub_questions,
-                        "model": model,
-                    },
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, "musique_pro_phaseA")
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method="rlm",
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "error": str(e), "error_type": error_type,
-                        "hops": sample.hops, "doc_length": sample.doc_length,
-                        "model": model,
-                    },
-                ))
-
-        save_results(results, "musique_pro_phaseA")
-
-    elif phase == "B":
-        # RLM on 3-hop only
-        rlm_samples = [s for s in samples if s.hops == 3]
-        controller = get_controller("rlm", model)
-        trace_dir = RESULTS_DIR / "traces" / "musique_pro" / "rlm"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, sample in enumerate(tqdm(rlm_samples, desc="musique_pro/rlm_3hop")):
-            sid = sample.sample_id
-            usage_start = tracker.snapshot()
-            try:
-                result, elapsed = _run_single(
-                    controller, sample.document, sample.question, sid, trace_dir
-                )
-                metrics = _best_metrics(result.answer, sample.answer, sample.answer_aliases)
-                results.append(SampleResult(
-                    sample_id=sid, method="rlm",
-                    question=sample.question,
-                    predicted=result.answer, reference=sample.answer,
-                    metrics=metrics, confidence=result.confidence,
-                    duration_s=elapsed,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "hops": sample.hops,
-                        "doc_length": sample.doc_length,
-                        "bridge_entities": sample.bridge_entities,
-                        "sub_questions": sample.sub_questions,
-                        "model": model,
-                    },
-                ))
-            except BudgetExceededError:
-                logger.error("Budget exceeded, stopping.")
-                save_results(results, "musique_pro_phaseB")
-                return results
-            except Exception as e:
-                error_type = _classify_error(e)
-                logger.error("Error on %s: %s", sid, e)
-                results.append(SampleResult(
-                    sample_id=sid, method="rlm",
-                    question=sample.question,
-                    predicted="ERROR", reference=sample.answer,
-                    metrics={"exact_match": 0, "f1": 0, "rouge_l": 0},
-                    confidence=0, duration_s=0,
-                    status=error_type,
-                    **_usage_payload(usage_start),
-                    metadata={
-                        "error": str(e), "error_type": error_type,
-                        "hops": sample.hops, "doc_length": sample.doc_length,
-                        "model": model,
-                    },
-                ))
-
-        save_results(results, "musique_pro_phaseB")
-
-    return results
-
-
-def save_results(results: list[SampleResult], filename: str) -> Path:
-    """Save results to JSON."""
-    out_path = RESULTS_DIR / f"{filename}.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    data = []
-    for r in results:
-        data.append({
-            "sample_id": r.sample_id,
-            "method": r.method,
-            "question": r.question,
-            "predicted": r.predicted,
-            "reference": r.reference,
-            "metrics": r.metrics,
-            "confidence": r.confidence,
-            "duration_s": r.duration_s,
-            "input_tokens": r.input_tokens,
-            "output_tokens": r.output_tokens,
-            "llm_calls": r.llm_calls,
-            "cost_usd": r.cost_usd,
-            "status": r.status,
-            "metadata": r.metadata,
-        })
-
-    with open(out_path, "w") as f:
-        json.dump(data, f, indent=2)
-
-    logger.info("Saved %d results to %s", len(results), out_path)
-    return out_path
-
-
-def run_all_experiments() -> None:
-    """Run all benchmarks and save results.
-
-    Resumable: each benchmark saves incrementally after each method.
-    Re-running skips already-completed methods automatically.
-    """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-
-    # 1. Needle-in-haystack
-    logger.info("=== Needle-in-Haystack ===")
-    run_needle_haystack()
-
-    # 2. Multi-hop
-    logger.info("=== Multi-hop ===")
-    run_multihop()
-
-    # 3. LongBench
-    logger.info("=== LongBench ===")
-    run_longbench()
-
-    # 4. MuSiQue (RAG vs RLM stress test)
-    logger.info("=== MuSiQue ===")
-    run_musique()
-
-    # 5. RLM with Pro model (subset)
-    logger.info("=== RLM Pro ===")
-    run_needle_haystack(
-        methods=["rlm"], model=settings.model_pro, max_samples=20,
-        save_as="needle_rlm_pro",
-    )
-
-    # 6. Pro MuSiQue Phase A (RAG all + RLM 2-hop)
-    logger.info("=== Pro MuSiQue Phase A ===")
-    run_pro_musique(phase="A")
-    # Phase B (RLM 3-hop) — run separately on day 2:
-    # run_pro_musique(phase="B")
-
-    from analysis.plots import generate_all_plots
-
-    logger.info("=== Plots ===")
-    generate_all_plots()
+    rows = runner.run()
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row["status"]] = statuses.get(row["status"], 0) + 1
+    print(json.dumps({"result_path": str(output), "rows": len(rows), "statuses": statuses}, indent=2))
+    return 0 if statuses.get("error", 0) == 0 else 1
 
 
 if __name__ == "__main__":
-    run_all_experiments()
+    raise SystemExit(main())

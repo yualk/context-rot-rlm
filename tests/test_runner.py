@@ -1,97 +1,107 @@
-"""Tests for experiment runner utilities."""
+"""Observable contracts for the paired, resumable experiment runner."""
 
-from types import SimpleNamespace
+from __future__ import annotations
 
-import pytest
-
-from experiments import runner
-from src.controllers.fullcontext import FullContextController
-
-
-def test_run_single_skips_retriever_for_fullcontext(monkeypatch):
-    controller = FullContextController()
-
-    def _should_not_build(*args, **kwargs):
-        raise AssertionError("HybridRetriever should not be built for fullcontext")
-
-    monkeypatch.setattr(runner, "HybridRetriever", _should_not_build)
-    monkeypatch.setattr(
-        "src.controllers.fullcontext.generate_json",
-        lambda *args, **kwargs: {"answer": "ok", "confidence": 1.0, "reasoning": "stub"},
-    )
-
-    result, elapsed = runner._run_single(
-        controller=controller,
-        document="alpha beta gamma",
-        question="What is the answer?",
-        sample_id="sample-1",
-    )
-
-    assert result.answer == "ok"
-    assert elapsed >= 0
+from benchmarks.diagnostic import DiagnosticSample
+from experiments.runner import ExperimentRunner
+from src.controllers.base import BaseController, ControllerResult
+from src.trace.tracer import TraceNode
 
 
-def test_run_needle_haystack_requires_api_key(monkeypatch, tmp_path):
-    monkeypatch.setattr(runner.settings, "google_api_key", "")
-    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+class FixedController(BaseController):
+    requires_retriever = False
 
-    with pytest.raises(RuntimeError, match="GOOGLE_API_KEY"):
-        runner.run_needle_haystack(
-            methods=["fullcontext"],
-            max_samples=1,
-            save_as="needle_auth_guard",
+    def __init__(self, method: str, calls: list[tuple[str, str]]) -> None:
+        self.method_name = method
+        self.calls = calls
+
+    def answer(self, question, store, **kwargs):
+        self.calls.append((self.method_name, store.doc_id))
+        trace = TraceNode(action=self.method_name, input=question, output="42")
+        trace.finish()
+        return ControllerResult(
+            answer="42",
+            confidence=1.0,
+            method=self.method_name,
+            trace=trace,
+            metadata={"observed_chars": len(store.full_text)},
         )
 
 
-def test_run_needle_haystack_can_skip_completed_methods_without_api_key(monkeypatch, tmp_path):
-    monkeypatch.setattr(runner.settings, "google_api_key", "")
-    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
-    monkeypatch.setattr(runner, "_load_partial", lambda filename: ([], {"fullcontext"}))
-
-    results = runner.run_needle_haystack(
-        methods=["fullcontext"],
-        max_samples=1,
-        save_as="needle_resume_guard",
+def _sample(sample_id: str = "sample-1") -> DiagnosticSample:
+    return DiagnosticSample(
+        sample_id=sample_id,
+        task_identity="task-1",
+        document="record: answer 42",
+        question="What is the answer?",
+        answer="42",
+        context_length_tokens=5,
+        metadata={"benchmark": "sniah"},
     )
 
-    assert results == []
+
+def test_runner_persists_each_paired_method_cell(tmp_path, monkeypatch):
+    monkeypatch.setattr("experiments.runner._source_revision", lambda: "test-revision")
+    calls = []
+    runner = ExperimentRunner(
+        samples=[_sample()],
+        methods=["left", "right"],
+        output_path=tmp_path / "results.jsonl",
+        benchmark="fixture",
+        controller_factory=lambda method: FixedController(method, calls),
+    )
+
+    rows = runner.run()
+
+    assert {(row["sample_id"], row["method"]) for row in rows} == {
+        ("sample-1", "left"),
+        ("sample-1", "right"),
+    }
+    assert all(row["score"] == 1.0 for row in rows)
+    assert len((tmp_path / "results.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
-def test_run_multihop_keeps_2hop_samples_for_fullcontext_and_mapreduce(monkeypatch, tmp_path):
-    samples = [
-        SimpleNamespace(document="doc-2", question="q2", answer="a2", hops=2, doc_length=500000),
-        SimpleNamespace(document="doc-3", question="q3", answer="a3", hops=3, doc_length=500000),
-    ]
+def test_runner_resumes_at_sample_method_granularity(tmp_path, monkeypatch):
+    monkeypatch.setattr("experiments.runner._source_revision", lambda: "test-revision")
+    path = tmp_path / "results.jsonl"
+    initial_calls = []
+    ExperimentRunner(
+        samples=[_sample()],
+        methods=["left", "right"],
+        output_path=path,
+        benchmark="fixture",
+        controller_factory=lambda method: FixedController(method, initial_calls),
+    ).run()
 
-    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
-    monkeypatch.setattr(runner, "gen_multihop", lambda: samples)
-    monkeypatch.setattr(runner, "_load_partial", lambda filename: ([], set()))
-    monkeypatch.setattr(runner, "_require_google_api_key", lambda: None)
-    monkeypatch.setattr(runner, "save_results", lambda results, save_as: None)
-    monkeypatch.setattr(runner, "get_controller", lambda method, model=None: object())
-    monkeypatch.setattr(
-        runner,
-        "_run_single",
-        lambda controller, document, question, sample_id, trace_dir=None: (
-            SimpleNamespace(answer="stub", confidence=1.0),
-            0.01,
+    resumed_calls = []
+    rows = ExperimentRunner(
+        samples=[_sample()],
+        methods=["left", "right"],
+        output_path=path,
+        benchmark="fixture",
+        controller_factory=lambda method: FixedController(method, resumed_calls),
+    ).run()
+
+    assert resumed_calls == []
+    assert len(rows) == 2
+
+
+def test_runner_records_context_limit_without_marking_cell_complete(tmp_path, monkeypatch):
+    from src.controllers.fullcontext import FullContextController
+    from tests.test_paper_rlm_controller import ScriptedClient
+
+    monkeypatch.setattr("experiments.runner._source_revision", lambda: "test-revision")
+    runner = ExperimentRunner(
+        samples=[_sample()],
+        methods=["fullcontext"],
+        output_path=tmp_path / "results.jsonl",
+        benchmark="fixture",
+        controller_factory=lambda method: FullContextController(
+            client=ScriptedClient([]), max_input_tokens=1
         ),
     )
-    monkeypatch.setattr(
-        runner,
-        "compute_all_metrics",
-        lambda predicted, reference: {"exact_match": 0.0, "f1": 0.0, "rouge_l": 0.0},
-    )
 
-    results = runner.run_multihop(
-        methods=["fullcontext", "mapreduce"],
-        save_as="multihop_test",
-    )
+    rows = runner.run()
 
-    observed = sorted((row.method, row.metadata["hops"], row.metadata["doc_length"]) for row in results)
-    assert observed == [
-        ("fullcontext", 2, 500000),
-        ("fullcontext", 3, 500000),
-        ("mapreduce", 2, 500000),
-        ("mapreduce", 3, 500000),
-    ]
+    assert rows[0]["status"] == "context_window_exceeded"
+    assert runner.store.pending("fullcontext", ["sample-1"]) == ["sample-1"]
