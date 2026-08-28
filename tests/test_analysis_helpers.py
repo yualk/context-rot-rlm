@@ -1,21 +1,40 @@
-"""Tests for analysis helper tables."""
+"""Tests for paired JSONL analysis summaries."""
 
-import pandas as pd
+from __future__ import annotations
 
-from analysis.analyze import _common_cap_table
+import json
+
+import pytest
+
+from analysis.analyze import analyze_rows, load_jsonl
 
 
-def test_common_cap_table_uses_cheapest_mean_cap():
-    df = pd.DataFrame([
-        {"method": "cheap", "exact_match": 1.0, "f1": 1.0, "rouge_l": 1.0, "cost_usd": 0.5},
-        {"method": "cheap", "exact_match": 0.5, "f1": 0.5, "rouge_l": 0.5, "cost_usd": 0.5},
-        {"method": "expensive", "exact_match": 1.0, "f1": 1.0, "rouge_l": 1.0, "cost_usd": 0.4},
-        {"method": "expensive", "exact_match": 0.0, "f1": 0.0, "rouge_l": 0.0, "cost_usd": 0.9},
-    ])
+def _rows(config_hash: str = "cfg"):
+    return [
+        {"config_hash": config_hash, "sample_id": "a", "task_identity": "t1", "method": "rag", "status": "ok", "score": 0.2, "duration_s": 1, "generation_calls": 1, "generation_input_tokens": 10, "embedding_calls": 0, "context_length_tokens": 100},
+        {"config_hash": config_hash, "sample_id": "a", "task_identity": "t1", "method": "rlm_depth1", "status": "ok", "score": 0.8, "duration_s": 2, "generation_calls": 2, "generation_input_tokens": 20, "embedding_calls": 0, "context_length_tokens": 100},
+        {"config_hash": config_hash, "sample_id": "b", "task_identity": "t2", "method": "rag", "status": "ok", "score": 1.0, "duration_s": 1, "generation_calls": 1, "generation_input_tokens": 10, "embedding_calls": 0, "context_length_tokens": 200},
+        {"config_hash": config_hash, "sample_id": "b", "task_identity": "t2", "method": "rlm_depth1", "status": "error", "score": 0.0, "duration_s": 2, "generation_calls": 1, "generation_input_tokens": 10, "embedding_calls": 0, "context_length_tokens": 200},
+    ]
 
-    summary = _common_cap_table(df, "cost_usd")
 
-    assert summary.loc["cheap", "cost_usd_cap"] == 0.5
-    assert summary.loc["cheap", "coverage"] == 1.0
-    assert summary.loc["expensive", "coverage"] == 0.5
-    assert summary.loc["expensive", "f1"] == 1.0
+def test_analysis_reports_coverage_and_only_matched_paired_effects():
+    summary = analyze_rows(_rows(), baseline="rag", bootstrap_iterations=100, seed=3)
+
+    assert summary["methods"]["rag"]["coverage"] == 1.0
+    assert summary["methods"]["rlm_depth1"]["coverage"] == 0.5
+    comparison = summary["paired_comparisons"][0]
+    assert comparison["n_pairs"] == 1
+    assert comparison["mean_difference"] == pytest.approx(0.6)
+
+
+def test_analysis_refuses_to_mix_configuration_hashes():
+    with pytest.raises(ValueError, match="multiple configurations"):
+        analyze_rows(_rows("a") + _rows("b"), bootstrap_iterations=10)
+
+
+def test_jsonl_loader_ignores_only_a_truncated_final_line(tmp_path):
+    path = tmp_path / "results.jsonl"
+    path.write_text(json.dumps(_rows()[0]) + "\n{\"sample_id\":", encoding="utf-8")
+
+    assert load_jsonl(path) == [_rows()[0]]

@@ -1,316 +1,160 @@
-"""Aggregate and analyze experiment results."""
+"""Analyze new JSONL experiments with paired, task-clustered comparisons."""
 
 from __future__ import annotations
 
+import argparse
 import json
-import logging
+from collections import Counter, defaultdict
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from statistics import fmean
+from typing import Any, Iterable
 
-import numpy as np
-import pandas as pd
-
-from src.config import PROJECT_ROOT, settings
-
-logger = logging.getLogger(__name__)
-
-RESULTS_DIR = PROJECT_ROOT / settings.output_dir
+from analysis.paired import paired_method_difference
 
 
-def load_results(filename: str) -> pd.DataFrame:
-    """Load results JSON into a DataFrame."""
-    path = RESULTS_DIR / f"{filename}.json"
-    with open(path) as f:
-        data = json.load(f)
-
-    rows = []
-    for r in data:
-        row = {
-            "sample_id": r["sample_id"],
-            "method": r["method"],
-            "question": r["question"],
-            "predicted": r["predicted"],
-            "reference": r["reference"],
-            "confidence": r["confidence"],
-            "duration_s": r["duration_s"],
-            "input_tokens": r.get("input_tokens", 0),
-            "output_tokens": r.get("output_tokens", 0),
-            "llm_calls": r.get("llm_calls", 0),
-            "cost_usd": r.get("cost_usd", 0.0),
-            "status": r.get(
-                "status",
-                "error" if r.get("predicted") == "ERROR" or r.get("metadata", {}).get("error") else "ok",
-            ),
-            **r["metrics"],
-            **r.get("metadata", {}),
-        }
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def _scoreable(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep only completed samples when aggregating benchmark quality."""
-    if "status" not in df.columns:
-        return df
-    return df[df["status"] == "ok"].copy()
-
-
-def _efficiency_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Average cost, latency, and LLM calls per completed sample."""
-    cols = [c for c in ["cost_usd", "duration_s", "llm_calls", "input_tokens", "output_tokens"] if c in df.columns]
-    if not cols:
-        return pd.DataFrame()
-    return df.groupby("method")[cols].mean()
-
-
-def _tradeoff_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Summarize accuracy alongside efficiency ratios."""
-    cols = [c for c in ["f1", "rouge_l", "cost_usd", "duration_s", "llm_calls"] if c in df.columns]
-    if not cols:
-        return pd.DataFrame()
-
-    summary = df.groupby("method")[cols].mean()
-    if "cost_usd" in summary.columns:
-        summary["f1_per_dollar"] = summary["f1"] / summary["cost_usd"].replace(0, np.nan)
-    if "duration_s" in summary.columns:
-        summary["f1_per_second"] = summary["f1"] / summary["duration_s"].replace(0, np.nan)
-    if "llm_calls" in summary.columns:
-        summary["f1_per_call"] = summary["f1"] / summary["llm_calls"].replace(0, np.nan)
-    return summary
-
-
-def _bootstrap_intervals(
-    df: pd.DataFrame,
-    metrics: tuple[str, ...] = ("exact_match", "f1", "rouge_l"),
-    n_boot: int = 1000,
-    seed: int = settings.seed,
-) -> pd.DataFrame:
-    """Bootstrap 95% confidence intervals for metric means by method."""
-    if df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    rng = np.random.default_rng(seed)
-    for method, group in df.groupby("method"):
-        row: dict[str, float | str] = {"method": method}
-        for metric in metrics:
-            values = group[metric].to_numpy(dtype=float)
-            if len(values) == 0:
-                continue
-            boots = np.empty(n_boot, dtype=float)
-            for i in range(n_boot):
-                sample = rng.choice(values, size=len(values), replace=True)
-                boots[i] = sample.mean()
-            row[f"{metric}_mean"] = float(values.mean())
-            row[f"{metric}_ci_low"] = float(np.percentile(boots, 2.5))
-            row[f"{metric}_ci_high"] = float(np.percentile(boots, 97.5))
-        rows.append(row)
-
-    return pd.DataFrame(rows).set_index("method")
-
-
-def _common_cap_table(df: pd.DataFrame, cap_col: str) -> pd.DataFrame:
-    """Compare methods under the cheapest method's average per-sample cap."""
-    required = {"exact_match", "f1", "rouge_l", cap_col, "method"}
-    if df.empty or not required.issubset(df.columns):
-        return pd.DataFrame()
-
-    cap_value = df.groupby("method")[cap_col].mean().min()
-    capped = df[df[cap_col] <= cap_value].copy()
-    if capped.empty:
-        return pd.DataFrame()
-
-    summary = capped.groupby("method")[["exact_match", "f1", "rouge_l", cap_col]].mean()
-    summary["samples_kept"] = capped.groupby("method").size()
-    summary["coverage"] = summary["samples_kept"] / df.groupby("method").size()
-    summary[f"{cap_col}_cap"] = cap_value
-    return summary
-
-
-def needle_analysis() -> dict[str, pd.DataFrame]:
-    """Analyze needle-in-haystack results."""
-    df = _scoreable(load_results("needle_haystack"))
-
-    # Per-method overall scores
-    overall = df.groupby("method")[["exact_match", "f1", "rouge_l"]].mean()
-
-    # Accuracy by haystack length
-    by_length = df.groupby(["method", "haystack_length"])[["f1"]].mean().unstack(0)
-
-    # Accuracy by needle position
-    by_position = df.groupby(["method", "needle_position"])[["f1"]].mean().unstack(0)
-
-    # Context rot: difference between best and worst position per method×length
-    rot = df.groupby(["method", "haystack_length", "needle_position"])["f1"].mean()
-    rot = rot.unstack("needle_position")
-    rot_diff = rot.max(axis=1) - rot.min(axis=1)
-    rot_diff = rot_diff.unstack("method")
-
-    return {
-        "overall": overall,
-        "confidence_intervals": _bootstrap_intervals(df),
-        "efficiency": _efficiency_table(df),
-        "tradeoffs": _tradeoff_table(df),
-        "within_common_cost_cap": _common_cap_table(df, "cost_usd"),
-        "within_common_call_cap": _common_cap_table(df, "llm_calls"),
-        "by_length": by_length,
-        "by_position": by_position,
-        "context_rot": rot_diff,
-    }
-
-
-def multihop_analysis() -> dict[str, pd.DataFrame]:
-    """Analyze multi-hop results."""
-    df = _scoreable(load_results("multihop"))
-
-    overall = df.groupby("method")[["exact_match", "f1", "rouge_l"]].mean()
-    by_hops = df.groupby(["method", "hops"])[["f1"]].mean().unstack(0)
-
-    tables: dict[str, pd.DataFrame] = {
-        "overall": overall,
-        "confidence_intervals": _bootstrap_intervals(df),
-        "efficiency": _efficiency_table(df),
-        "tradeoffs": _tradeoff_table(df),
-        "within_common_cost_cap": _common_cap_table(df, "cost_usd"),
-        "within_common_call_cap": _common_cap_table(df, "llm_calls"),
-        "by_hops": by_hops,
-    }
-
-    if "doc_length" in df.columns:
-        tables["by_doc_length"] = df.groupby(["method", "doc_length"])[["f1"]].mean().unstack(0)
-        tables["by_condition"] = (
-            df.groupby(["hops", "doc_length", "method"])[["f1", "rouge_l"]]
-            .mean()
-            .unstack("method")
-        )
-
-    return tables
-
-
-def longbench_analysis() -> dict[str, pd.DataFrame]:
-    """Analyze LongBench results."""
-    df = _scoreable(load_results("longbench"))
-
-    overall = df.groupby("method")[["exact_match", "f1", "rouge_l"]].mean()
-    by_dataset = df.groupby(["method", "dataset"])[["f1", "rouge_l"]].mean().unstack(0)
-
-    return {
-        "overall": overall,
-        "confidence_intervals": _bootstrap_intervals(df),
-        "efficiency": _efficiency_table(df),
-        "tradeoffs": _tradeoff_table(df),
-        "within_common_cost_cap": _common_cap_table(df, "cost_usd"),
-        "within_common_call_cap": _common_cap_table(df, "llm_calls"),
-        "by_dataset": by_dataset,
-    }
-
-
-def musique_analysis() -> dict[str, pd.DataFrame]:
-    """Analyze MuSiQue multi-hop results."""
-    df = _scoreable(load_results("musique"))
-
-    overall = df.groupby("method")[["exact_match", "f1", "rouge_l"]].mean()
-    by_hops = df.groupby(["method", "hops"])[["f1"]].mean().unstack(0)
-    by_doc_length = df.groupby(["method", "doc_length"])[["f1"]].mean().unstack(0)
-    by_condition = df.groupby(["hops", "doc_length", "method"])[["f1", "rouge_l"]].mean().unstack("method")
-
-    return {
-        "overall": overall,
-        "confidence_intervals": _bootstrap_intervals(df),
-        "efficiency": _efficiency_table(df),
-        "tradeoffs": _tradeoff_table(df),
-        "within_common_cost_cap": _common_cap_table(df, "cost_usd"),
-        "within_common_call_cap": _common_cap_table(df, "llm_calls"),
-        "by_hops": by_hops,
-        "by_doc_length": by_doc_length,
-        "by_condition": by_condition,
-    }
-
-
-def pro_musique_analysis() -> dict[str, pd.DataFrame]:
-    """Analyze Pro model MuSiQue results (phaseA + phaseB combined)."""
-    frames = []
-    for name in ["musique_pro_phaseA", "musique_pro_phaseB"]:
+def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    """Load complete JSONL rows, tolerating only a truncated final write."""
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    rows: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
         try:
-            frames.append(load_results(name))
-        except FileNotFoundError:
-            pass
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                break
+            raise
+        if not isinstance(value, dict):
+            raise ValueError(f"Invalid row at line {index + 1}")
+        rows.append(value)
+    return rows
 
-    if not frames:
-        raise FileNotFoundError("No Pro MuSiQue results found")
 
-    df = _scoreable(pd.concat(frames, ignore_index=True))
+def analyze_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    baseline: str = "rag",
+    config_hash: str | None = None,
+    bootstrap_iterations: int = 10_000,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Return coverage, descriptive means, and matched paired differences."""
+    materialized = list(rows)
+    hashes = {str(row.get("config_hash", "")) for row in materialized}
+    if config_hash is None:
+        if len(hashes) > 1:
+            raise ValueError(
+                "Result file contains multiple configurations; pass config_hash explicitly."
+            )
+        config_hash = next(iter(hashes), "")
+    selected = [row for row in materialized if str(row.get("config_hash", "")) == config_hash]
+    if not selected:
+        raise ValueError(f"No rows found for configuration {config_hash!r}.")
 
-    overall = df.groupby("method")[["exact_match", "f1", "rouge_l"]].mean()
-    by_hops = df.groupby(["method", "hops"])[["f1"]].mean().unstack(0)
-    by_doc_length = df.groupby(["method", "doc_length"])[["f1"]].mean().unstack(0)
-    by_condition = (
-        df.groupby(["hops", "doc_length", "method"])[["f1", "rouge_l"]]
-        .mean()
-        .unstack("method")
-    )
+    status_counts = Counter(str(row.get("status", "unknown")) for row in selected)
+    by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in selected:
+        by_method[str(row["method"])].append(row)
+
+    method_summary: dict[str, dict[str, Any]] = {}
+    for method, method_rows in sorted(by_method.items()):
+        successful = [row for row in method_rows if row.get("status") == "ok"]
+        method_summary[method] = {
+            "attempted": len(method_rows),
+            "successful": len(successful),
+            "coverage": len(successful) / len(method_rows),
+            "mean_score": fmean(float(row["score"]) for row in successful) if successful else None,
+            "mean_duration_s": (
+                fmean(float(row["duration_s"]) for row in successful) if successful else None
+            ),
+            "mean_generation_calls": (
+                fmean(float(row["generation_calls"]) for row in successful)
+                if successful
+                else None
+            ),
+            "mean_generation_input_tokens": (
+                fmean(float(row["generation_input_tokens"]) for row in successful)
+                if successful
+                else None
+            ),
+            "mean_embedding_calls": (
+                fmean(float(row["embedding_calls"]) for row in successful)
+                if successful
+                else None
+            ),
+        }
+
+    comparisons = []
+    for treatment in sorted(set(by_method).difference({baseline})):
+        try:
+            paired = paired_method_difference(
+                selected,
+                baseline=baseline,
+                treatment=treatment,
+                iterations=bootstrap_iterations,
+                seed=seed,
+            )
+        except ValueError:
+            continue
+        comparisons.append(asdict(paired))
+
+    by_context: dict[str, list[dict[str, Any]]] = {}
+    lengths = sorted({int(row["context_length_tokens"]) for row in selected})
+    for length in lengths:
+        subset = [row for row in selected if int(row["context_length_tokens"]) == length]
+        context_comparisons = []
+        for treatment in sorted(set(by_method).difference({baseline})):
+            try:
+                paired = paired_method_difference(
+                    subset,
+                    baseline=baseline,
+                    treatment=treatment,
+                    iterations=bootstrap_iterations,
+                    seed=seed,
+                )
+            except ValueError:
+                continue
+            context_comparisons.append(asdict(paired))
+        by_context[str(length)] = context_comparisons
 
     return {
-        "overall": overall,
-        "confidence_intervals": _bootstrap_intervals(df),
-        "efficiency": _efficiency_table(df),
-        "tradeoffs": _tradeoff_table(df),
-        "by_hops": by_hops,
-        "by_doc_length": by_doc_length,
-        "by_condition": by_condition,
+        "config_hash": config_hash,
+        "baseline": baseline,
+        "rows": len(selected),
+        "status_counts": dict(sorted(status_counts.items())),
+        "methods": method_summary,
+        "paired_comparisons": comparisons,
+        "paired_by_context_length": by_context,
     }
 
 
-def full_analysis() -> dict[str, Any]:
-    """Run all analyses and return tables."""
-    results = {}
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("results", type=Path)
+    parser.add_argument("--baseline", default="rag")
+    parser.add_argument("--config-hash")
+    parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args(argv)
 
-    try:
-        results["needle"] = needle_analysis()
-        logger.info("Needle analysis complete")
-    except FileNotFoundError:
-        logger.warning("No needle results found")
-
-    try:
-        results["multihop"] = multihop_analysis()
-        logger.info("Multi-hop analysis complete")
-    except FileNotFoundError:
-        logger.warning("No multihop results found")
-
-    try:
-        results["longbench"] = longbench_analysis()
-        logger.info("LongBench analysis complete")
-    except FileNotFoundError:
-        logger.warning("No longbench results found")
-
-    try:
-        results["musique"] = musique_analysis()
-        logger.info("MuSiQue analysis complete")
-    except FileNotFoundError:
-        logger.warning("No MuSiQue results found")
-
-    try:
-        results["pro_musique"] = pro_musique_analysis()
-        logger.info("Pro MuSiQue analysis complete")
-    except FileNotFoundError:
-        logger.warning("No Pro MuSiQue results found")
-
-    return results
-
-
-def print_summary(results: dict[str, Any]) -> None:
-    """Print a text summary of all results."""
-    for bench_name, tables in results.items():
-        print(f"\n{'='*60}")
-        print(f"  {bench_name.upper()}")
-        print(f"{'='*60}")
-        for table_name, df in tables.items():
-            print(f"\n--- {table_name} ---")
-            print(df.to_string())
+    summary = analyze_rows(
+        load_jsonl(args.results),
+        baseline=args.baseline,
+        config_hash=args.config_hash,
+        bootstrap_iterations=args.bootstrap_iterations,
+        seed=args.seed,
+    )
+    rendered = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    if args.output is None:
+        print(rendered, end="")
+    else:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    results = full_analysis()
-    print_summary(results)
+    raise SystemExit(main())
