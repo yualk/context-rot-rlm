@@ -37,6 +37,7 @@ def analyze_rows(
     *,
     baseline: str = "rag",
     config_hash: str | None = None,
+    condition_field: str | None = None,
     bootstrap_iterations: int = 10_000,
     seed: int = 42,
 ) -> dict[str, Any]:
@@ -119,6 +120,34 @@ def analyze_rows(
             context_comparisons.append(asdict(paired))
         by_context[str(length)] = context_comparisons
 
+    by_condition: dict[str, list[dict[str, Any]]] = {}
+    if condition_field is not None:
+        condition_values = sorted({
+            row.get("sample_metadata", {}).get(condition_field)
+            for row in selected
+            if row.get("sample_metadata", {}).get(condition_field) is not None
+        })
+        for value in condition_values:
+            subset = [
+                row
+                for row in selected
+                if row.get("sample_metadata", {}).get(condition_field) == value
+            ]
+            condition_comparisons = []
+            for treatment in sorted(set(by_method).difference({baseline})):
+                try:
+                    paired = paired_method_difference(
+                        subset,
+                        baseline=baseline,
+                        treatment=treatment,
+                        iterations=bootstrap_iterations,
+                        seed=seed,
+                    )
+                except ValueError:
+                    continue
+                condition_comparisons.append(asdict(paired))
+            by_condition[str(value)] = condition_comparisons
+
     return {
         "config_hash": config_hash,
         "baseline": baseline,
@@ -127,6 +156,8 @@ def analyze_rows(
         "methods": method_summary,
         "paired_comparisons": comparisons,
         "paired_by_context_length": by_context,
+        "condition_field": condition_field,
+        "paired_by_condition": by_condition,
     }
 
 
@@ -135,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("results", type=Path)
     parser.add_argument("--baseline", default="rag")
     parser.add_argument("--config-hash")
+    parser.add_argument("--condition-field")
     parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path)
@@ -144,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         load_jsonl(args.results),
         baseline=args.baseline,
         config_hash=args.config_hash,
+        condition_field=args.condition_field,
         bootstrap_iterations=args.bootstrap_iterations,
         seed=args.seed,
     )

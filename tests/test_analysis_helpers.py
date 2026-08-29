@@ -28,6 +28,25 @@ def test_analysis_reports_coverage_and_only_matched_paired_effects():
     assert comparison["mean_difference"] == pytest.approx(0.6)
 
 
+
+def test_analysis_groups_paired_effects_by_declared_condition():
+    rows = _rows()
+    for row in rows:
+        row["sample_metadata"] = {
+            "num_records": 100 if row["sample_id"] == "a" else 200
+        }
+
+    summary = analyze_rows(
+        rows,
+        baseline="rag",
+        condition_field="num_records",
+        bootstrap_iterations=100,
+    )
+
+    comparison = summary["paired_by_condition"]["100"][0]
+    assert comparison["n_pairs"] == 1
+    assert comparison["mean_difference"] == pytest.approx(0.6)
+
 def test_analysis_refuses_to_mix_configuration_hashes():
     with pytest.raises(ValueError, match="multiple configurations"):
         analyze_rows(_rows("a") + _rows("b"), bootstrap_iterations=10)
