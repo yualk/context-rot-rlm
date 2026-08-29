@@ -17,6 +17,7 @@ from benchmarks.diagnostic import (
     OolongScorer,
     generate_dense_aggregation,
     generate_sniah,
+    generate_recursive_aggregation,
     load_oolong,
 )
 from experiments.result_store import ResultStore, configuration_hash
@@ -31,7 +32,13 @@ from src.model_client import ModelClient, SubscriptionLimitError, get_default_cl
 from src.trace.trace_viewer import export_trace
 
 RESULTS_DIR = PROJECT_ROOT / settings.output_dir
-PRIMARY_METHODS = ("fullcontext", "rag", "rlm_depth0", "rlm_depth1")
+PRIMARY_METHODS = (
+    "fullcontext",
+    "rag",
+    "rlm_symbolic",
+    "rlm_depth0",
+    "rlm_depth1",
+)
 ControllerFactory = Callable[[str], BaseController]
 
 
@@ -42,6 +49,8 @@ def get_controller(method: str, *, client: ModelClient | None = None) -> BaseCon
         return FullContextController(client=shared)
     if method == "rag":
         return RAGController(client=shared)
+    if method == "rlm_symbolic":
+        return RLMController(client=shared, max_depth=0, allow_subcalls=False)
     if method == "rlm_depth0":
         return RLMController(client=shared, max_depth=0)
     if method == "rlm_depth1":
@@ -198,7 +207,7 @@ class ExperimentRunner:
 
 def _score(sample: DiagnosticSample, prediction: str) -> float:
     benchmark = sample.metadata.get("benchmark")
-    if benchmark in {"oolong", "dense_aggregation"}:
+    if benchmark in {"oolong", "dense_aggregation", "recursive_aggregation"}:
         return OolongScorer().score(
             prediction,
             sample.answer,
@@ -261,6 +270,20 @@ def _build_samples(args: argparse.Namespace) -> tuple[list[DiagnosticSample], di
             for task in range(args.tasks)
         ]
         return samples, {"record_counts": sizes, "tasks_per_size": args.tasks}
+    if args.benchmark == "recursive":
+        samples = [
+            generate_recursive_aggregation(
+                num_sections=args.sections,
+                records_per_section=args.records_per_section,
+                seed=args.seed + task,
+            )
+            for task in range(args.tasks)
+        ]
+        return samples, {
+            "num_sections": args.sections,
+            "records_per_section": args.records_per_section,
+            "tasks": args.tasks,
+        }
     samples = load_oolong(
         split=args.split,
         max_samples=args.max_samples,
@@ -278,7 +301,7 @@ def _build_samples(args: argparse.Namespace) -> tuple[list[DiagnosticSample], di
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("benchmark", choices=("sniah", "dense", "oolong"))
+    parser.add_argument("benchmark", choices=("sniah", "dense", "recursive", "oolong"))
     parser.add_argument("--methods", nargs="+", choices=PRIMARY_METHODS, default=list(PRIMARY_METHODS))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--trace-dir", type=Path)
@@ -287,6 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-samples", type=int, default=50)
     parser.add_argument("--context-lengths", type=int, nargs="+")
     parser.add_argument("--record-counts", type=int, nargs="+")
+    parser.add_argument("--sections", type=int, default=4)
+    parser.add_argument("--records-per-section", type=int, default=100)
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
     return parser
 

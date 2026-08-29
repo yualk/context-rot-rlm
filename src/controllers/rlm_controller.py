@@ -99,6 +99,7 @@ class RLMController(BaseController):
         max_depth: int | None = None,
         max_iterations: int | None = None,
         max_subcalls: int | None = None,
+        allow_subcalls: bool = True,
     ) -> None:
         del model  # Model selection belongs to the injected client.
         self.client = client or get_default_client()
@@ -107,6 +108,7 @@ class RLMController(BaseController):
             settings.rlm_max_iterations if max_iterations is None else max_iterations
         )
         self.max_subcalls = settings.rlm_max_subcalls if max_subcalls is None else max_subcalls
+        self.allow_subcalls = allow_subcalls
         self.history_chars = settings.rlm_history_chars
         self.stdout_chars = settings.rlm_stdout_chars
 
@@ -120,7 +122,11 @@ class RLMController(BaseController):
         trace = TraceNode(
             action="rlm",
             input=question,
-            metadata={"mode": "paper_repl", "max_depth": self.max_depth},
+            metadata={
+                "mode": "paper_repl",
+                "max_depth": self.max_depth,
+                "allow_subcalls": self.allow_subcalls,
+            },
         )
         budget = _CallBudget(limit=self.max_subcalls)
         outcome = self._run_repl(
@@ -136,6 +142,7 @@ class RLMController(BaseController):
                 "confidence": outcome.confidence,
                 "subcalls": budget.used,
                 "rlm_depth_reached": budget.max_depth_reached,
+                "allow_subcalls": self.allow_subcalls,
             }
         )
         trace.finish()
@@ -148,6 +155,7 @@ class RLMController(BaseController):
                 "controller_style": "paper_repl",
                 "subcalls": budget.used,
                 "rlm_depth_reached": budget.max_depth_reached,
+                "allow_subcalls": self.allow_subcalls,
             },
         )
 
@@ -179,9 +187,15 @@ class RLMController(BaseController):
                 history=self._format_history(history),
                 observation=self._clip(observation, self.stdout_chars),
             )
+            system = ROOT_SYSTEM
+            if not self.allow_subcalls:
+                system += (
+                    "\nModel subcalls are disabled for this ablation. Solve only "
+                    "with Python operations over `context`."
+                )
             decision = self.client.generate_json(
                 prompt,
-                system=ROOT_SYSTEM,
+                system=system,
                 max_tokens=1200,
             )
             thought = str(decision.get("thought", "")).strip()
@@ -250,6 +264,8 @@ class RLMController(BaseController):
 
 
         def llm_query(prompt: str, model: str | None = None) -> str:
+            if not self.allow_subcalls:
+                raise RuntimeError("Model subcalls are disabled for this ablation.")
             del model
             budget.consume()
             node = trace.add_child(
@@ -274,6 +290,8 @@ class RLMController(BaseController):
             return [llm_query(prompt, model=model) for prompt in prompts]
 
         def rlm_query(subcontext: str, sub_question: str) -> str:
+            if not self.allow_subcalls:
+                raise RuntimeError("Model subcalls are disabled for this ablation.")
             if depth >= self.max_depth:
                 return llm_query(f"Context:\n{subcontext}\n\nQuestion: {sub_question}")
             budget.consume()

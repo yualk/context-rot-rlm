@@ -79,3 +79,64 @@ def test_rlm_can_programmatically_invoke_single_sub_model_calls():
     assert result.answer == "beta"
     assert result.metadata["subcalls"] == 1
     assert any(node.action == "llm_query" for node in result.trace.walk())
+
+
+def test_rlm_can_disable_all_model_subcalls():
+    client = ScriptedClient([
+        json.dumps({
+            "thought": "try a prohibited subcall",
+            "code": 'answer = llm_query("Return beta")',
+        }),
+        json.dumps({
+            "thought": "solve from context instead",
+            "code": "\n".join([
+                'answer = context.split()[-1]',
+                'FINAL_VAR("answer")',
+            ]),
+        }),
+    ])
+    controller = RLMController(
+        client=client,
+        max_depth=0,
+        max_iterations=2,
+        allow_subcalls=False,
+    )
+
+    result = controller.answer("Find the answer", _store("alpha beta"))
+
+    assert result.answer == "beta"
+    assert result.metadata["subcalls"] == 0
+    assert result.metadata["allow_subcalls"] is False
+    assert not any(node.action in {"llm_query", "rlm_query"} for node in result.trace.walk())
+
+
+def test_depth_one_rlm_recurses_over_a_programmatic_subcontext():
+    client = ScriptedClient([
+        json.dumps({
+            "thought": "delegate the section recursively",
+            "code": "\n".join([
+                'answer = rlm_query(context, "Return the final word")',
+                'FINAL_VAR("answer")',
+            ]),
+        }),
+        json.dumps({
+            "thought": "solve the delegated section",
+            "code": "\n".join([
+                'answer = context.split()[-1]',
+                'FINAL_VAR("answer")',
+            ]),
+        }),
+    ])
+    controller = RLMController(
+        client=client,
+        max_depth=1,
+        max_iterations=2,
+        max_subcalls=2,
+    )
+
+    result = controller.answer("Find the answer", _store("alpha beta"))
+
+    assert result.answer == "beta"
+    assert result.metadata["subcalls"] == 1
+    assert result.metadata["rlm_depth_reached"] == 1
+    assert any(node.action == "rlm_query" for node in result.trace.walk())

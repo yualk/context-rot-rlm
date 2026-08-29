@@ -5,6 +5,7 @@ from __future__ import annotations
 from benchmarks.diagnostic import (
     OolongScorer,
     generate_dense_aggregation,
+    generate_recursive_aggregation,
     generate_sniah,
 )
 
@@ -33,6 +34,20 @@ def test_dense_aggregation_requires_processing_many_records():
     assert len(sample.document.splitlines()) == 200
     assert sample.answer.isdigit()
     assert sample.metadata["semantic_work"] == "linear"
+
+
+def test_recursive_aggregation_has_independent_semantic_sections():
+    sample = generate_recursive_aggregation(
+        num_sections=4,
+        records_per_section=25,
+        seed=13,
+    )
+
+    assert sample.document.count("=== SECTION ") == 4
+    assert len(sample.document.splitlines()) == 4 * 27
+    assert int(sample.answer) == sum(sample.metadata["section_counts"])
+    assert len(sample.metadata["section_targets"]) == 4
+    assert sample.metadata["semantic_work"] == "hierarchical"
 
 
 def test_oolong_numeric_scorer_matches_paper_partial_credit():

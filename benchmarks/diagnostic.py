@@ -133,6 +133,82 @@ _CATEGORY_TEXTS = {
     ),
 }
 
+_CATEGORY_RULES = {
+    "science": "scientific research or empirical measurement",
+    "business": "commercial, financial, or manufacturing activity",
+    "sports": "athletic competition, coaching, or league activity",
+    "culture": "artistic, literary, musical, museum, or theatre activity",
+}
+
+
+def generate_recursive_aggregation(
+    *,
+    num_sections: int = 4,
+    records_per_section: int = 100,
+    seed: int = 42,
+) -> DiagnosticSample:
+    """Generate section-local semantic counts that can be recursively reduced."""
+    if num_sections < 2:
+        raise ValueError("num_sections must be at least two")
+    if records_per_section < 1:
+        raise ValueError("records_per_section must be positive")
+
+    rng = random.Random(seed)
+    categories = list(_CATEGORY_TEXTS)
+    target_order: list[str] = []
+    while len(target_order) < num_sections:
+        shuffled = categories[:]
+        rng.shuffle(shuffled)
+        target_order.extend(shuffled)
+
+    places = ("Northport", "Lakeview", "Riverton", "Stonebridge", "Westhaven")
+    sections: list[str] = []
+    section_counts: list[int] = []
+    section_targets = target_order[:num_sections]
+    for section_index, target in enumerate(section_targets):
+        lines = [
+            f"=== SECTION {section_index:02d} ===",
+            f"QUALIFYING RULE: Count records about {_CATEGORY_RULES[target]}.",
+        ]
+        count = 0
+        for record_index in range(records_per_section):
+            category = rng.choice(categories)
+            sentence = rng.choice(_CATEGORY_TEXTS[category])
+            place = rng.choice(places)
+            year = rng.randint(1990, 2025)
+            lines.append(
+                f"record-{section_index:02d}-{record_index:05d}: "
+                f"In {place} during {year}, {sentence} "
+                f"Archive reference {rng.randint(1000, 9999)}."
+            )
+            count += int(category == target)
+        sections.extend(lines)
+        section_counts.append(count)
+
+    document = "\n".join(sections)
+    return DiagnosticSample(
+        sample_id=f"recursive-{num_sections}-{records_per_section}-{seed}",
+        task_identity=f"recursive-{seed}",
+        document=document,
+        question=(
+            "Each section states its own qualifying rule. Count the qualifying "
+            "records in every section and return their total sum. Analyze sections "
+            "independently; when recursive analysis is available, use rlm_query on "
+            "each section. Return only the integer."
+        ),
+        answer=str(sum(section_counts)),
+        context_length_tokens=max(1, len(document.split())),
+        metadata={
+            "benchmark": "recursive_aggregation",
+            "semantic_work": "hierarchical",
+            "num_sections": num_sections,
+            "records_per_section": records_per_section,
+            "section_counts": section_counts,
+            "section_targets": section_targets,
+            "answer_type": "ANSWER_TYPE.NUMERIC",
+        },
+    )
+
 
 def generate_dense_aggregation(*, num_records: int = 400, seed: int = 42) -> DiagnosticSample:
     """Generate an OOLONG-style linear semantic aggregation task."""
