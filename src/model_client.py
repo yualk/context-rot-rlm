@@ -220,14 +220,14 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
         if lines and lines[-1].strip() == "```":
             lines.pop()
         text = "\n".join(lines).strip()
+    decoder = json.JSONDecoder()
     try:
-        value = json.loads(text)
+        value, _ = decoder.raw_decode(text)
     except json.JSONDecodeError:
         start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
+        if start < 0:
             raise
-        value = json.loads(text[start : end + 1])
+        value, _ = decoder.raw_decode(text[start:])
     if not isinstance(value, dict):
         raise ValueError("Expected a JSON object from the model.")
     return value

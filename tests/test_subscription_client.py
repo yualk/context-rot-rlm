@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from subprocess import CompletedProcess
 
-from src.model_client import OmpSubscriptionClient
+from src.model_client import OmpSubscriptionClient, _parse_json_object
 
 
 def test_subscription_client_uses_luna_without_tools_or_sessions(tmp_path: Path):
@@ -56,3 +56,12 @@ def test_subscription_client_uses_luna_without_tools_or_sessions(tmp_path: Path)
     assert "--no-skills" in args
     assert "--no-rules" in args
     assert "openai-codex/gpt-5.6-luna" in args
+
+
+def test_json_parser_accepts_a_valid_object_before_trailing_model_text():
+    payload = _parse_json_object(
+        '{"thought":"first","code":"print(1)"}\n'
+        '{"thought":"duplicate","code":"print(2)"}'
+    )
+
+    assert payload == {"thought": "first", "code": "print(1)"}
