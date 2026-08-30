@@ -32,12 +32,17 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _normalize_answer(value: str) -> str:
+    return " ".join(value.strip().casefold().split()).strip(".,;:[](){}\"'")
+
+
 def analyze_rows(
     rows: Iterable[dict[str, Any]],
     *,
     baseline: str = "rag",
     config_hash: str | None = None,
     condition_field: str | None = None,
+    metric: str = "score",
     bootstrap_iterations: int = 10_000,
     seed: int = 42,
 ) -> dict[str, Any]:
@@ -50,9 +55,19 @@ def analyze_rows(
                 "Result file contains multiple configurations; pass config_hash explicitly."
             )
         config_hash = next(iter(hashes), "")
-    selected = [row for row in materialized if str(row.get("config_hash", "")) == config_hash]
+    selected = [
+        dict(row)
+        for row in materialized
+        if str(row.get("config_hash", "")) == config_hash
+    ]
     if not selected:
         raise ValueError(f"No rows found for configuration {config_hash!r}.")
+    for row in selected:
+        if "exact_match" not in row and {"prediction", "reference"}.issubset(row):
+            row["exact_match"] = float(
+                _normalize_answer(str(row["prediction"]))
+                == _normalize_answer(str(row["reference"]))
+            )
 
     status_counts = Counter(str(row.get("status", "unknown")) for row in selected)
     by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -67,6 +82,11 @@ def analyze_rows(
             "successful": len(successful),
             "coverage": len(successful) / len(method_rows),
             "mean_score": fmean(float(row["score"]) for row in successful) if successful else None,
+            "mean_exact_match": (
+                fmean(float(row["exact_match"]) for row in successful if "exact_match" in row)
+                if any("exact_match" in row for row in successful)
+                else None
+            ),
             "mean_duration_s": (
                 fmean(float(row["duration_s"]) for row in successful) if successful else None
             ),
@@ -94,6 +114,7 @@ def analyze_rows(
                 selected,
                 baseline=baseline,
                 treatment=treatment,
+                metric=metric,
                 iterations=bootstrap_iterations,
                 seed=seed,
             )
@@ -113,6 +134,7 @@ def analyze_rows(
                     baseline=baseline,
                     treatment=treatment,
                     iterations=bootstrap_iterations,
+                    metric=metric,
                     seed=seed,
                 )
             except ValueError:
@@ -140,6 +162,7 @@ def analyze_rows(
                         subset,
                         baseline=baseline,
                         treatment=treatment,
+                        metric=metric,
                         iterations=bootstrap_iterations,
                         seed=seed,
                     )
@@ -151,6 +174,7 @@ def analyze_rows(
     return {
         "config_hash": config_hash,
         "baseline": baseline,
+        "metric": metric,
         "rows": len(selected),
         "status_counts": dict(sorted(status_counts.items())),
         "methods": method_summary,
@@ -167,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline", default="rag")
     parser.add_argument("--config-hash")
     parser.add_argument("--condition-field")
+    parser.add_argument("--metric", choices=("score", "exact_match"), default="score")
     parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path)
@@ -177,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         baseline=args.baseline,
         config_hash=args.config_hash,
         condition_field=args.condition_field,
+        metric=args.metric,
         bootstrap_iterations=args.bootstrap_iterations,
         seed=args.seed,
     )

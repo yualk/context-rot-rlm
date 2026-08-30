@@ -176,6 +176,10 @@ class ExperimentRunner:
             "reference": sample.answer,
             "prediction": prediction,
             "score": score,
+            "exact_match": float(
+                status == "ok"
+                and _normalize_answer(prediction) == _normalize_answer(sample.answer)
+            ),
             "confidence": confidence,
             "duration_s": duration_s,
             "context_length_tokens": sample.context_length_tokens,
