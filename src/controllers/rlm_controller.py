@@ -7,6 +7,7 @@ context symbolically and invoke ordinary sub-model calls from generated code.
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import logging
@@ -402,7 +403,22 @@ class RLMController(BaseController):
         return value if len(value) <= limit else value[: limit - 3] + "..."
 
     def _safe_builtins(self) -> dict[str, Any]:
+        allowed_modules = {"collections", "json", "math", "re", "statistics"}
+
+        def restricted_import(
+            name: str,
+            globals: dict[str, Any] | None = None,
+            locals: dict[str, Any] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> Any:
+            del globals, locals, fromlist
+            if level != 0 or name.split(".", 1)[0] not in allowed_modules:
+                raise ImportError(f"Import of {name!r} is not allowed in the RLM REPL.")
+            return importlib.import_module(name)
+
         return {
+            "__import__": restricted_import,
             "abs": abs,
             "all": all,
             "any": any,

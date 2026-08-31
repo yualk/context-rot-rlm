@@ -140,3 +140,21 @@ def test_depth_one_rlm_recurses_over_a_programmatic_subcontext():
     assert result.metadata["subcalls"] == 1
     assert result.metadata["rlm_depth_reached"] == 1
     assert any(node.action == "rlm_query" for node in result.trace.walk())
+
+
+def test_rlm_allows_safe_standard_library_imports():
+    client = ScriptedClient([
+        json.dumps({
+            "thought": "extract with a regular expression",
+            "code": "\n".join([
+                "import re",
+                "answer = re.search(r'needle: (\\S+)', context).group(1)",
+                'FINAL_VAR("answer")',
+            ]),
+        }),
+    ])
+    controller = RLMController(client=client, max_iterations=1)
+
+    result = controller.answer("Find the needle", _store("needle: cobalt-42"))
+
+    assert result.answer == "cobalt-42"
